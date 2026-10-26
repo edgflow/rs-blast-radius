@@ -3,9 +3,11 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use blast_radius::config::Config;
 use blast_radius::graph::{Confidence, Graph};
+use blast_radius::openai::OpenAi;
 use blast_radius::parse::{self, Kind};
-use blast_radius::{impact, report};
+use blast_radius::{impact, predict, report};
 
 #[derive(Parser)]
 #[command(version, about = "Predict what a code change might break")]
@@ -22,9 +24,22 @@ enum Command {
     Graph { dir: PathBuf },
     /// What would be affected by changing a function (static analysis only).
     Impact { dir: PathBuf, function: String },
+    /// Predict what a proposed change could break: the blast radius plus an AI review.
+    Predict {
+        dir: PathBuf,
+        function: String,
+        /// The change you plan to make, in plain words.
+        #[arg(long)]
+        change: String,
+        /// Write the Markdown report to this file instead of printing it.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
+    let _ = dotenvy::dotenv();
     match Cli::parse().command {
         Command::Functions { dir } => {
             let codebase = parse::parse_dir(&dir)?;
@@ -74,6 +89,29 @@ fn main() -> Result<()> {
                 "{}",
                 report::impact_text(&graph, &impact::blast_radius(&graph, target))
             );
+        }
+        Command::Predict {
+            dir,
+            function,
+            change,
+            out,
+        } => {
+            let config = Config::from_env()?;
+            let codebase = parse::parse_dir(&dir)?;
+            let graph = Graph::build(&codebase);
+            let target = graph.find(&function).map_err(anyhow::Error::msg)?;
+            let impact = impact::blast_radius(&graph, target);
+            let ai = OpenAi::new(&config.openai_api_key, &config.openai_base_url);
+            let prediction =
+                predict::predict(&ai, &config.model, &codebase, &graph, &impact, &change).await?;
+            let markdown = report::prediction_markdown(&graph, &impact, &prediction, &change);
+            match out {
+                Some(path) => {
+                    std::fs::write(&path, markdown)?;
+                    println!("report written to {}", path.display());
+                }
+                None => print!("{markdown}"),
+            }
         }
     }
     Ok(())
